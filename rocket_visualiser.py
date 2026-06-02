@@ -361,16 +361,32 @@ def update(frame):
     rgeom  = rotate_geom(GEOM, R)
     plot_rocket(ax3d, rgeom)
 
+    # ── Snapshot all deques atomically to avoid race-condition length mismatches
+    # The reader thread can append between individual np.array() calls, so we
+    # convert everything in one go and then trim to the shortest length.
+    t_arr     = np.array(data['time'])
+    gx_arr    = np.array(data['gx'])
+    gy_arr    = np.array(data['gy'])
+    gz_arr    = np.array(data['gz'])
+    pitch_arr = np.array(data['pitch'])
+    roll_arr  = np.array(data['roll'])
+    yaw_arr   = np.array(data['yaw'])
+
+    n = min(len(t_arr), len(gx_arr), len(gy_arr), len(gz_arr),
+            len(pitch_arr), len(roll_arr), len(yaw_arr))
+    t_arr     = t_arr[:n]
+    gx_arr    = gx_arr[:n]
+    gy_arr    = gy_arr[:n]
+    gz_arr    = gz_arr[:n]
+    pitch_arr = pitch_arr[:n]
+    roll_arr  = roll_arr[:n]
+    yaw_arr   = yaw_arr[:n]
+
     # ── Gyro rate time series ─────────────────────────────────────────────
     ax_gyro.cla()
     ax_gyro.set_facecolor('#111111')
 
-    t_arr  = np.array(data['time'])
-    gx_arr = np.array(data['gx'])
-    gy_arr = np.array(data['gy'])
-    gz_arr = np.array(data['gz'])
-
-    if len(t_arr) > 1:
+    if n > 1:
         t_rel = t_arr - t_arr[-1]   # time relative to "now", so x scrolls left
         ax_gyro.plot(t_rel, gx_arr, color='#ff4444', linewidth=0.8, label='gx')
         ax_gyro.plot(t_rel, gy_arr, color='#44ff44', linewidth=0.8, label='gy')
@@ -403,11 +419,7 @@ def update(frame):
     ax_angle.cla()
     ax_angle.set_facecolor('#111111')
 
-    pitch_arr = np.array(data['pitch'])
-    roll_arr  = np.array(data['roll'])
-    yaw_arr   = np.array(data['yaw'])
-
-    if len(t_arr) > 1:
+    if n > 1:
         t_rel = t_arr - t_arr[-1]
         ax_angle.plot(t_rel, pitch_arr, color='#ff8800', linewidth=0.8,
                       label='pitch')
