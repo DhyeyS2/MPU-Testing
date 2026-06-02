@@ -1,6 +1,6 @@
 /*
  * rocket_firmware.ino
- * Gyro-only orientation for rocket TVC — no accelerometer
+ * Gyro-only TVC orientation — MPU6050 + ESP32
  *
  * Required libraries (copy from github.com/jrowberg/i2cdevlib):
  *   I2Cdev, MPU6050  →  Arduino libraries directory
@@ -9,43 +9,52 @@
  *   VCC → 3.3V   GND → GND   SDA → GPIO 21   SCL → GPIO 22   AD0 → GND
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * WHY NO ACCELEROMETER
+ * TWO-PHASE OPERATION: PAD MODE vs FLIGHT MODE
  * ─────────────────────────────────────────────────────────────────────────────
- * Accelerometers measure specific force: gravity PLUS linear acceleration.
- * During rocket boost both are present simultaneously and cannot be separated.
- * Using the accelerometer for tilt correction during flight produces completely
- * wrong angles. Gyro-only integration is the correct choice for the flight
- * phase of a rocket.
  *
- * ─────────────────────────────────────────────────────────────────────────────
- * THE DRIFT PROBLEM AND HOW WE SOLVE IT WITHOUT ACCELEROMETER
- * ─────────────────────────────────────────────────────────────────────────────
- * Gyro drift has one root cause: the zero-rate offset (bias) is not perfectly
- * constant. It shifts slowly with temperature after calibration ends.
+ * PAD MODE (before launch):
+ *   - Runtime bias learning is ACTIVE.
+ *     The bias estimate continuously tracks temperature drift so that by the
+ *     time the rocket launches the bias is as accurate as it can possibly be.
+ *   - Integration is GATED when stationary.
+ *     Noise below the stationary threshold does not accumulate into the angle.
+ *   - The rocket sits on the pad for potentially minutes. Without this gating
+ *     even 0.01 °/s of residual bias would add up to visible angle error before
+ *     launch and the TVC controller would try to "correct" a phantom lean.
  *
- * Solution — runtime bias tracking:
- *   Every loop we check if all three gyro axes are reading below a small
- *   threshold (e.g. 1.5 °/s). If yes, the sensor is stationary and the
- *   current gyro reading IS the bias error, not real rotation. We use that
- *   to slowly update our bias estimate with a leaky integrator:
- *     bias = (1 - LEARN) * bias + LEARN * raw_reading
- *   LEARN = 0.0005 means the bias estimate moves very slowly — it takes
- *   ~2000 stationary samples (4 seconds at 500 Hz) to fully converge.
- *   This is slow enough that real slow rotation is not mistaken for bias,
- *   but fast enough to track temperature drift over a 30-second pre-launch.
+ * FLIGHT MODE (after launch detected):
+ *   - Runtime bias learning is FROZEN at the last pad value.
+ *     During flight the rocket is genuinely rotating. If we kept learning we
+ *     would mistake real rotation for bias and subtract out the signal we need.
+ *   - Stationary gating is DISABLED.
+ *     The rocket may fly nearly straight (low angular rates) when the TVC loop
+ *     is working well. We must still integrate those small rates accurately.
+ *   - The bias estimate from the pad phase is the best we have and is held
+ *     for the duration of the flight.
  *
- *   The moment movement is detected the bias update freezes and the last
- *   good estimate is held for the duration of the motion.
+ * LAUNCH DETECTION — gyro magnitude threshold:
+ *   Without an accelerometer the cleanest launch signal available is the gyro
+ *   itself. When the rocket leaves the launch rod it will experience a clear
+ *   disturbance from rod-exit wobble and initial atmosphere. The gyro magnitude
+ *   will spike well above the bench noise floor.
+ *   Threshold = 15 °/s. A value this high cannot be reached by bench vibration
+ *   but will be reached immediately at rod exit on any practical launch.
+ *   Once triggered, flight mode is latched permanently — it never reverts.
+ *   This avoids any false reversion if the rocket happens to fly very straight.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * WHY ±500 °/s RANGE
  * ─────────────────────────────────────────────────────────────────────────────
- * At ±250 °/s, flipping the sensor by hand (which easily exceeds 300 °/s)
- * clips the register at its max value. The integration then accumulates a
- * wrong rate for however long the clip lasts, producing a permanent jump in
- * the angle that never corrects itself.
- * ±500 °/s doubles the range while halving resolution (65.5 LSB/°/s vs 131).
- * The noise increase is small compared to eliminating hard clipping errors.
+ * The C6 motor produces ~255 °/s² angular acceleration against this rocket's
+ * MMOI. An uncorrected lean of just 1° would produce over 250 °/s rotation
+ * within one second. ±250 °/s would clip immediately. ±500 °/s gives headroom.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * SERIAL OUTPUT FORMAT
+ * ─────────────────────────────────────────────────────────────────────────────
+ * One CSV line per loop iteration at 500 Hz:
+ *   gx,gy,gz,pitch,roll,yaw,dt_us,flight
+ * flight = 0 on pad, 1 in flight — lets the visualiser show mode clearly.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -53,53 +62,54 @@
 #include "MPU6050.h"
 #include "Wire.h"
 
-// ─── Tunable constants ────────────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-// ±500 °/s range — prevents clipping on fast movements.
-// Sensitivity = 65.5 LSB/(°/s).
-const float GYRO_SENSITIVITY   = 65.5f;
+// Gyro sensitivity at ±500 °/s = 65.5 LSB/(°/s).
+const float GYRO_SENSITIVITY    = 65.5f;
 
-// Stationary detection threshold in °/s.
-// If all three axes read below this, assume the sensor is not rotating.
-// Set just above your observed noise floor (check the visualiser noise box).
-// Too high → bias tracks during slow real rotation (bad).
-// Too low  → bias never updates because noise exceeds threshold (bad).
-const float STATIONARY_THRESH  = 1.5f;
+// PAD MODE: stationary detection threshold (°/s).
+// Set ~3× your observed noise floor (read from the visualiser noise stats box).
+// Typical noise floor for MPU6050 at 500 Hz after DLPF ≈ 0.05–0.15 °/s σ.
+// 0.5 °/s threshold is safely above noise but well below any real movement.
+const float STATIONARY_THRESH   = 0.5f;
 
-// How fast the runtime bias estimate tracks temperature drift.
-// 0.0005 means roughly 2000 stationary samples to fully update.
-// At 500 Hz that is ~4 seconds of stillness to fully correct a step change.
-const float BIAS_LEARN_RATE    = 0.0005f;
+// PAD MODE: how fast the bias tracks temperature drift while stationary.
+// 0.001 = takes ~1000 stationary samples (2 s at 500 Hz) to fully update.
+// Faster tracking is fine on the pad because we have unlimited time.
+const float BIAS_LEARN_RATE     = 0.001f;
 
-// EMA smoothing on the gyro output — applied AFTER bias removal.
-// 0.5 is a bit more responsive than before; raise toward 1.0 for even less
-// smoothing if you need maximum speed (at the cost of more noise).
-const float GYRO_EMA_ALPHA     = 0.5f;
+// LAUNCH DETECT: gyro vector magnitude threshold to switch to flight mode.
+// 15 °/s cannot be reached by bench vibration but is easily exceeded at rod exit.
+// Lower this if your launch rod is very smooth; raise it if bench vibration
+// is triggering false launches (watch the visualiser flight indicator).
+const float LAUNCH_THRESH_DPS   = 15.0f;
+
+// EMA smoothing on gyro output.
+// 0.6 = responsive with mild smoothing. The hardware DLPF already did the
+// heavy lifting; this just takes the edge off sample-to-sample jitter.
+const float GYRO_EMA_ALPHA      = 0.6f;
 
 // Multi-sample averaging per loop iteration.
-const int   NUM_AVG_SAMPLES    = 2;
+const int   NUM_AVG_SAMPLES     = 2;
 
 // 500 Hz loop.
 const unsigned long LOOP_PERIOD_US = 2000UL;
 
-// Initial calibration — longer warm-up and more samples for better accuracy.
-const int   CAL_WARMUP_MS      = 3000;   // 3 s thermal soak
-const int   CAL_SAMPLES        = 5000;   // ~1.5 s of data at I2C speed
+// Initial calibration.
+const int   CAL_WARMUP_MS       = 3000;   // thermal soak before collecting
+const int   CAL_SAMPLES         = 5000;   // ~1.7 s of I2C reads
 
-const int   BAUD_RATE          = 115200;
+const int   BAUD_RATE           = 115200;
 
 // ─── Globals ─────────────────────────────────────────────────────────────────
 
 MPU6050 imu;
 
-// Bias in raw LSB — updated both at startup and at runtime when stationary.
 float biasX = 0.0f, biasY = 0.0f, biasZ = 0.0f;
-
-// EMA state.
 float filtGx = 0.0f, filtGy = 0.0f, filtGz = 0.0f;
-
-// Integrated angles.
 float pitch = 0.0f, roll = 0.0f, yaw = 0.0f;
+
+bool  inFlight = false;   // latched true at launch detection, never reverts
 
 unsigned long lastTime = 0;
 
@@ -115,18 +125,11 @@ void setup() {
         while (true) {}
     }
 
-    // ±500 °/s — GYRO_CONFIG register, FS_SEL = 0b01.
     imu.setFullScaleGyroRange(MPU6050_GYRO_FS_500);
-
-    // 42 Hz DLPF — removes vibration above 42 Hz.
     imu.setDLPFMode(MPU6050_DLPF_BW_42);
-
-    // Maximum output rate = 1000 Hz.
     imu.setRate(0);
 
     // ── Initial bias calibration ──────────────────────────────────────────
-    // Keep the sensor perfectly still.
-    // Longer warm-up lets the chip reach stable temperature.
     Serial.println("CALIBRATING");
     delay(CAL_WARMUP_MS);
 
@@ -146,13 +149,12 @@ void setup() {
 
 // ─── loop() ──────────────────────────────────────────────────────────────────
 void loop() {
-    // Precise 500 Hz timing.
     while ((micros() - lastTime) < LOOP_PERIOD_US) {}
     unsigned long now = micros();
     float dt = (now - lastTime) * 1e-6f;
     lastTime = now;
 
-    // ── Average multiple raw samples ──────────────────────────────────────
+    // ── Average raw samples ───────────────────────────────────────────────
     long rawSumX = 0, rawSumY = 0, rawSumZ = 0;
     for (int s = 0; s < NUM_AVG_SAMPLES; s++) {
         int16_t rx, ry, rz;
@@ -163,51 +165,67 @@ void loop() {
     float avgY = (float)rawSumY / NUM_AVG_SAMPLES;
     float avgZ = (float)rawSumZ / NUM_AVG_SAMPLES;
 
-    // ── Runtime bias tracking ─────────────────────────────────────────────
-    // Remove current bias estimate before checking the threshold.
-    float debiasedX = (avgX - biasX) / GYRO_SENSITIVITY;
-    float debiasedY = (avgY - biasY) / GYRO_SENSITIVITY;
-    float debiasedZ = (avgZ - biasZ) / GYRO_SENSITIVITY;
-
-    bool stationary = (fabsf(debiasedX) < STATIONARY_THRESH &&
-                       fabsf(debiasedY) < STATIONARY_THRESH &&
-                       fabsf(debiasedZ) < STATIONARY_THRESH);
-
-    if (stationary) {
-        // Sensor is still — slowly pull bias toward the current raw reading.
-        // This compensates for temperature drift between calibration and now.
-        biasX = (1.0f - BIAS_LEARN_RATE) * biasX + BIAS_LEARN_RATE * avgX;
-        biasY = (1.0f - BIAS_LEARN_RATE) * biasY + BIAS_LEARN_RATE * avgY;
-        biasZ = (1.0f - BIAS_LEARN_RATE) * biasZ + BIAS_LEARN_RATE * avgZ;
-    }
-
-    // Recompute with updated bias.
+    // ── De-bias ───────────────────────────────────────────────────────────
     float gx = (avgX - biasX) / GYRO_SENSITIVITY;
     float gy = (avgY - biasY) / GYRO_SENSITIVITY;
     float gz = (avgZ - biasZ) / GYRO_SENSITIVITY;
+
+    // ── Launch detection (one-way latch) ──────────────────────────────────
+    // Check gyro vector magnitude. Once latched, never un-latches.
+    if (!inFlight) {
+        float mag = sqrtf(gx*gx + gy*gy + gz*gz);
+        if (mag > LAUNCH_THRESH_DPS) {
+            inFlight = true;
+            // Freeze bias at current best estimate — no more learning.
+        }
+    }
+
+    // ── Pad mode: bias learning + stationary gating ───────────────────────
+    bool integrate = true;
+
+    if (!inFlight) {
+        float absGx = fabsf(gx);
+        float absGy = fabsf(gy);
+        float absGz = fabsf(gz);
+
+        bool stationary = (absGx < STATIONARY_THRESH &&
+                           absGy < STATIONARY_THRESH &&
+                           absGz < STATIONARY_THRESH);
+
+        if (stationary) {
+            // Refine bias toward current raw reading.
+            biasX = (1.0f - BIAS_LEARN_RATE) * biasX + BIAS_LEARN_RATE * avgX;
+            biasY = (1.0f - BIAS_LEARN_RATE) * biasY + BIAS_LEARN_RATE * avgY;
+            biasZ = (1.0f - BIAS_LEARN_RATE) * biasZ + BIAS_LEARN_RATE * avgZ;
+            // Recompute with updated bias.
+            gx = (avgX - biasX) / GYRO_SENSITIVITY;
+            gy = (avgY - biasY) / GYRO_SENSITIVITY;
+            gz = (avgZ - biasZ) / GYRO_SENSITIVITY;
+            // Do not integrate noise into the angle while sitting on pad.
+            integrate = false;
+        }
+    }
 
     // ── EMA smooth ────────────────────────────────────────────────────────
     filtGx = GYRO_EMA_ALPHA * gx + (1.0f - GYRO_EMA_ALPHA) * filtGx;
     filtGy = GYRO_EMA_ALPHA * gy + (1.0f - GYRO_EMA_ALPHA) * filtGy;
     filtGz = GYRO_EMA_ALPHA * gz + (1.0f - GYRO_EMA_ALPHA) * filtGz;
 
-    // ── Integrate — but zero out tiny noise when stationary ───────────────
-    // When stationary, force the integrated rate contribution to exactly zero.
-    // This stops noise from slowly adding up into the angle while you sit still.
-    if (stationary) {
-        // Do not integrate — hold current angle.
-    } else {
+    // ── Integrate ─────────────────────────────────────────────────────────
+    if (integrate) {
         pitch += filtGx * dt;
         roll  += filtGy * dt;
         yaw   += filtGz * dt;
     }
 
     // ── Serial output ─────────────────────────────────────────────────────
+    // Format: gx,gy,gz,pitch,roll,yaw,dt_us,flight
     Serial.print(filtGx, 4); Serial.print(',');
     Serial.print(filtGy, 4); Serial.print(',');
     Serial.print(filtGz, 4); Serial.print(',');
     Serial.print(pitch,  4); Serial.print(',');
     Serial.print(roll,   4); Serial.print(',');
     Serial.print(yaw,    4); Serial.print(',');
-    Serial.println((unsigned long)(dt * 1e6f));
+    Serial.print((unsigned long)(dt * 1e6f)); Serial.print(',');
+    Serial.println(inFlight ? 1 : 0);
 }

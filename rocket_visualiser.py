@@ -29,7 +29,7 @@ data = {
 }
 
 latest = {'pitch': 0.0, 'roll': 0.0, 'yaw': 0.0,
-          'gx': 0.0, 'gy': 0.0, 'gz': 0.0}
+          'gx': 0.0, 'gy': 0.0, 'gz': 0.0, 'flight': 0}
 
 # ─── Serial reader thread ─────────────────────────────────────────────────────
 def serial_reader():
@@ -49,16 +49,18 @@ def serial_reader():
         if not raw or not (raw[0].isdigit() or raw[0] == '-'):
             continue
         parts = raw.split(',')
-        if len(parts) != 7:
+        if len(parts) not in (7, 8):
             continue
         try:
             gx, gy, gz, pitch, roll, yaw = (float(p) for p in parts[:6])
+            flight = int(parts[7]) if len(parts) == 8 else 0
         except ValueError:
             continue
         data['gx'].append(gx);      data['gy'].append(gy);    data['gz'].append(gz)
         data['pitch'].append(pitch); data['roll'].append(roll); data['yaw'].append(yaw)
         latest['gx'] = gx;  latest['gy'] = gy;  latest['gz'] = gz
         latest['pitch'] = pitch; latest['roll'] = roll; latest['yaw'] = yaw
+        latest['flight'] = flight
 
 threading.Thread(target=serial_reader, daemon=True).start()
 
@@ -380,6 +382,14 @@ while running:
         yt = 290 + i * 60
         screen.blit(font_md.render(name, True, color), (NUM_X, yt))
         screen.blit(font_lg.render(f'{val:+7.3f}', True, WHITE), (NUM_X, yt + 20))
+
+    # Flight mode indicator
+    if latest['flight']:
+        mode_color, mode_text = (RED,   '** FLIGHT **')
+    else:
+        mode_color, mode_text = (GREEN, '   PAD      ')
+    mode_surf = font_lg.render(mode_text, True, mode_color)
+    screen.blit(mode_surf, (NUM_X, H - 52))
 
     screen.blit(font_sm.render(f'{clock.get_fps():.0f} fps', True, DGREY),
                 (NUM_X, H - 18))
