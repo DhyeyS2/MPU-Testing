@@ -1,57 +1,73 @@
 /*
  * rocket_firmware.ino
- * MPU6050 gyroscope data acquisition for rocket TVC flight computer
+ * MPU6050 gyroscope + accelerometer fusion for rocket TVC flight computer
  *
  * Required libraries — install by copying from github.com/jrowberg/i2cdevlib:
  *   I2Cdev
  *   MPU6050
- * Both folders go into your Arduino libraries directory
- * (typically ~/Documents/Arduino/libraries/ on Windows/Mac or ~/Arduino/libraries/ on Linux).
+ * Both folders go into your Arduino libraries directory.
  *
  * MPU6050 wiring to ESP32:
- *   VCC → 3.3V      (the MPU6050 runs on 3.3V; do NOT connect to 5V)
+ *   VCC → 3.3V
  *   GND → GND
- *   SDA → GPIO 21   (ESP32 default I2C data line)
- *   SCL → GPIO 22   (ESP32 default I2C clock line)
- *   AD0 → GND       (pulls the I2C address select pin low → address 0x68)
- *   INT → not connected for this project (we poll rather than use interrupts)
+ *   SDA → GPIO 21
+ *   SCL → GPIO 22
+ *   AD0 → GND  (I2C address 0x68)
+ *   INT → not connected
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * NOISE REDUCTION PIPELINE — why every stage matters
+ * WHY GYRO-ONLY DRIFTS AND HOW THE COMPLEMENTARY FILTER FIXES IT
  * ─────────────────────────────────────────────────────────────────────────────
  *
- * Stage 1 — Hardware DLPF (Digital Low Pass Filter) inside the MPU6050
- *   The MPU6050 contains a hardware filter on the gyro signal path.
- *   Setting DLPF_BW_42 configures a 42 Hz cutoff frequency.
- *   A rocket's actual rotation is slow — well below 10 Hz even for an agressive
- *   TVC maneuver. Motor vibration, on the other hand, is typically 50–500 Hz.
- *   By cutting off at 42 Hz we eliminate most vibration noise before it ever
- *   reaches the digital output register. This is free noise reduction that costs
- *   us nothing because the signal we care about is entirely below 42 Hz.
- *   Register affected: CONFIG (0x1A), bits [2:0] = DLPF_CFG.
- *   At DLPF_BW_42 the gyro internal sample rate becomes 1000 Hz.
+ * A gyroscope measures rotation rate (°/s). To get angle you integrate:
+ *   angle += rate * dt
+ * Any tiny error in rate — even 0.01 °/s of residual bias — accumulates
+ * forever. After 60 seconds that is 0.6° of error just from bias. Temperature
+ * changes shift the bias further. This is gyro drift and it cannot be removed
+ * by better calibration alone.
  *
- * Stage 2 — Multi-sample averaging in firmware
- *   Random electronic noise is uncorrelated sample-to-sample. If you average
- *   N samples of random noise, the noise amplitude shrinks by sqrt(N). So
- *   averaging 2 samples gives ~1.41× noise reduction, 4 samples gives 2× etc.
- *   We read 2 raw samples back-to-back as fast as I2C allows and average the
- *   raw integer counts before converting to float. This keeps integer arithmetic
- *   exact until the final conversion step and gives us a free ~1.41× improvement.
- *   The effective output rate becomes 1000 / 2 = 500 Hz, which is more than
- *   fast enough for a TVC loop (100–500 Hz is typical for model rocketry).
+ * An accelerometer measures the direction of gravity. When the sensor is
+ * stationary, gravity always points straight down, so you can compute the
+ * absolute pitch and roll angle from the accelerometer readings using atan2.
+ * This angle has NO long-term drift — gravity is always there as a reference.
+ * However, the accelerometer also picks up vibration and any linear
+ * acceleration (e.g. the rocket accelerating upward), so it is noisy and
+ * wrong during rapid movement.
  *
- * Stage 3 — Software Exponential Moving Average (EMA) filter
- *   Even after stages 1 and 2, a small amount of sample-to-sample jitter
- *   remains. The EMA is a single-pole IIR low-pass filter:
- *     filtered = alpha * new_reading + (1 - alpha) * previous_filtered
- *   alpha = 1.0 means no smoothing (output = raw input).
- *   alpha = 0.0 means infinite smoothing (output never changes).
- *   At alpha = 0.4 and 500 Hz, the 3 dB cutoff of the EMA is roughly
- *     f_cutoff ≈ (alpha / (2π)) * Fs ≈ (0.4 / 6.28) * 500 ≈ 32 Hz
- *   which adds a soft roll-off below the hardware DLPF, further suppressing
- *   any noise that leaked through while keeping phase lag small enough for
- *   a 500 Hz control loop.
+ * The complementary filter exploits both sensors' strengths:
+ *   angle = CF_ALPHA * (angle + gyro_rate * dt)      <- gyro integration
+ *         + (1 - CF_ALPHA) * accel_angle             <- accel absolute reference
+ *
+ * CF_ALPHA = 0.98 means:
+ *   - 98% of the angle update comes from the gyro (fast, responsive, no noise)
+ *   - 2% per step nudges the angle back toward what the accelerometer says
+ * Over time the 2% correction prevents drift from accumulating. During fast
+ * movement the accelerometer reading is ignored almost entirely (only 2%).
+ *
+ * This is the same principle used in every commercial flight controller
+ * (ArduPilot, Betaflight, etc.) before more sophisticated Kalman/Madgwick
+ * filters are applied. For bench testing and slow manoeuvres it works
+ * extremely well with almost no computational cost.
+ *
+ * IMPORTANT: The complementary filter corrects pitch and roll only.
+ * Yaw cannot be corrected this way because gravity has no yaw component —
+ * you cannot tell which way you are facing just by measuring "down".
+ * Yaw will still drift slowly. A magnetometer (compass) is needed to fix yaw.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY FAST MOVEMENT CAUSED LARGE ERRORS
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * At ±250 °/s full-scale range, if you physically rotate the sensor faster
+ * than 250 °/s the gyro output register clips at its maximum value (32767).
+ * The integration then accumulates a wrong rate for however long the motion
+ * lasts, producing a permanent offset in the integrated angle.
+ *
+ * Fix: switch to ±500 °/s range. This halves the resolution from
+ * 131 LSB/(°/s) to 65.5 LSB/(°/s), but prevents clipping during fast
+ * hand movements (which easily exceed 250 °/s). For a TVC rocket the
+ * complementary filter correction also helps pull the angle back to truth
+ * after any transient saturation.
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -61,96 +77,88 @@
 
 // ─── Tunable constants ────────────────────────────────────────────────────────
 
-// EMA smoothing factor (0 < alpha ≤ 1).
-// Increase toward 1.0 for less smoothing / faster response.
-// Decrease toward 0.0 for more smoothing / slower response.
-// 0.4 is a good starting point for a 500 Hz TVC loop.
-const float ALPHA = 0.4f;
+// Complementary filter coefficient.
+// 0.98 = trust gyro 98%, nudge toward accelerometer 2% every step.
+// Increase toward 1.0 to follow gyro more (more drift, less accel noise).
+// Decrease toward 0.9 to correct drift faster (more accel noise in output).
+const float CF_ALPHA = 0.98f;
 
-// Number of raw samples averaged per control loop iteration.
-// More samples = lower noise but lower effective output rate.
-// 2 samples → effective 500 Hz, noise reduced by ~1.41×.
-const int   NUM_AVG_SAMPLES = 2;
+// Gyro EMA smoothing (applied before the complementary filter).
+const float GYRO_ALPHA = 0.4f;
 
-// Target loop rate in microseconds (1 000 000 / 500 = 2000 µs per iteration).
+// Gyro sensitivity for ±500 °/s range = 65.5 LSB/(°/s).
+// (Changed from ±250 to prevent clipping on fast hand movements.)
+const float GYRO_SENSITIVITY = 65.5f;
+
+// Accelerometer sensitivity for ±2g range = 16384 LSB/g.
+const float ACCEL_SENSITIVITY = 16384.0f;
+
+// Number of raw gyro samples averaged per loop iteration.
+const int NUM_AVG_SAMPLES = 2;
+
+// 500 Hz loop target.
 const unsigned long LOOP_PERIOD_US = 2000UL;
 
-// Calibration: number of samples and warm-up delay.
-const int   CAL_SAMPLES       = 3000;
-const int   CAL_WARMUP_MS     = 2000;
+// Calibration settings.
+const int CAL_SAMPLES   = 3000;
+const int CAL_WARMUP_MS = 2000;
 
-// Serial baud rate — must match the Python visualiser constant.
-const int   BAUD_RATE         = 115200;
+const int BAUD_RATE = 115200;
 
-// ─── Global objects ───────────────────────────────────────────────────────────
+// ─── Globals ─────────────────────────────────────────────────────────────────
 
-MPU6050 imu;  // Default I2C address 0x68 (AD0 tied to GND)
+MPU6050 imu;
 
-// Calibration bias — mean gyro output while stationary, in raw LSB counts.
-// Subtracted from every reading so that true zero rotation → 0 LSB.
-float biasX = 0.0f, biasY = 0.0f, biasZ = 0.0f;
+// Gyro bias in raw LSB (measured during calibration at rest).
+float gyroBiasX = 0.0f, gyroBiasY = 0.0f, gyroBiasZ = 0.0f;
 
-// EMA filter state — initialised to zero, updated every loop iteration.
+// EMA filter state for gyro.
 float filtGx = 0.0f, filtGy = 0.0f, filtGz = 0.0f;
 
-// Integrated angles in degrees, accumulated from gyro rates × dt.
+// Final fused angles in degrees.
 float pitch = 0.0f, roll = 0.0f, yaw = 0.0f;
 
-// Timing: time of last loop iteration start in microseconds.
 unsigned long lastTime = 0;
 
-// ─── Helper: read one raw gyro sample ─────────────────────────────────────────
-// Fills the three int16 references with raw register counts from GYRO_XOUT,
-// GYRO_YOUT, GYRO_ZOUT (registers 0x43–0x48).
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 void readRawGyro(int16_t &rx, int16_t &ry, int16_t &rz) {
     imu.getRotation(&rx, &ry, &rz);
+}
+
+void readRawAccel(int16_t &ax, int16_t &ay, int16_t &az) {
+    imu.getAcceleration(&ax, &ay, &az);
 }
 
 // ─── setup() ─────────────────────────────────────────────────────────────────
 void setup() {
     Serial.begin(BAUD_RATE);
-
-    // Initialise I2C bus.  Wire.begin() uses GPIO 21 (SDA) and 22 (SCL) by
-    // default on the ESP32.  The MPU6050 supports up to 400 kHz fast-mode.
     Wire.begin();
-    Wire.setClock(400000);  // 400 kHz reduces I2C read time → faster averaging loop
-
-    // Initialise the MPU6050.  imu.initialize() writes to the PWR_MGMT_1
-    // register (0x6B) to wake the device from sleep and select the internal
-    // 8 MHz oscillator (or PLL if available).
+    Wire.setClock(400000);
     imu.initialize();
 
     if (!imu.testConnection()) {
         Serial.println("MPU6050 connection FAILED — check wiring");
-        while (true) {}  // halt; nothing useful we can do
+        while (true) {}
     }
 
-    // ── Gyroscope full-scale range ─────────────────────────────────────────
-    // Sets GYRO_CONFIG register (0x1B), bits [4:3] = FS_SEL = 0b00.
-    // ±250 °/s → sensitivity = 131.0 LSB/(°/s).
-    // Narrower range = finer resolution = lower quantisation noise per LSB.
-    // For a TVC rocket that rotates at most ~90 °/s this range is plenty.
-    imu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+    // ±500 °/s — wider range prevents clipping during fast movements.
+    // Sensitivity = 65.5 LSB/(°/s) instead of 131 LSB/(°/s) at ±250.
+    imu.setFullScaleGyroRange(MPU6050_GYRO_FS_500);
 
-    // ── Digital Low Pass Filter ────────────────────────────────────────────
-    // Sets CONFIG register (0x1A), bits [2:0] = DLPF_CFG = 0b011.
-    // Gyro bandwidth = 42 Hz, delay = 4.8 ms.
-    // This is the single most effective noise-reduction step in the pipeline.
+    // ±2g accelerometer range — maximum sensitivity, fine for orientation.
+    imu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+
+    // 42 Hz hardware DLPF — removes motor vibration above 42 Hz.
     imu.setDLPFMode(MPU6050_DLPF_BW_42);
 
-    // ── Output data rate ───────────────────────────────────────────────────
-    // Sets SMPLRT_DIV register (0x19).
-    // Formula: ODR = Gyro_Rate / (1 + SMPLRT_DIV).
-    // At DLPF_BW_42, Gyro_Rate = 1000 Hz.
-    // SMPLRT_DIV = 0 → ODR = 1000 / (1 + 0) = 1000 Hz.
-    // We want the fastest possible register update rate so our averaging loop
-    // is pulling fresh data every ~1 ms.
+    // Maximum output rate (1000 Hz at DLPF_BW_42).
     imu.setRate(0);
 
-    // ── Bias calibration ──────────────────────────────────────────────────
-    // Give the sensor 2 seconds to reach thermal equilibrium after power-on.
-    // The gyro zero-rate offset drifts with temperature; collecting bias data
-    // before the sensor stabilises will produce an inaccurate offset estimate.
+    // ── Calibration ───────────────────────────────────────────────────────
+    // Collect gyro bias only. Accel bias is not needed because the
+    // complementary filter uses accel for absolute angle, not rate.
+    // Keep the sensor perfectly still during this phase.
     Serial.println("CALIBRATING");
     delay(CAL_WARMUP_MS);
 
@@ -158,74 +166,74 @@ void setup() {
     for (int i = 0; i < CAL_SAMPLES; i++) {
         int16_t rx, ry, rz;
         readRawGyro(rx, ry, rz);
-        sumX += rx;
-        sumY += ry;
-        sumZ += rz;
-        // No explicit delay — the 400 kHz I2C transaction takes ~300 µs,
-        // so we naturally sample at roughly 3000 Hz during calibration.
+        sumX += rx; sumY += ry; sumZ += rz;
     }
-    biasX = (float)sumX / CAL_SAMPLES;
-    biasY = (float)sumY / CAL_SAMPLES;
-    biasZ = (float)sumZ / CAL_SAMPLES;
+    gyroBiasX = (float)sumX / CAL_SAMPLES;
+    gyroBiasY = (float)sumY / CAL_SAMPLES;
+    gyroBiasZ = (float)sumZ / CAL_SAMPLES;
+
+    // Initialise pitch and roll from accelerometer so the display starts at
+    // the correct physical orientation immediately — no spin-up period.
+    int16_t ax, ay, az;
+    readRawAccel(ax, ay, az);
+    float axg = ax / ACCEL_SENSITIVITY;
+    float ayg = ay / ACCEL_SENSITIVITY;
+    float azg = az / ACCEL_SENSITIVITY;
+    pitch = atan2(-axg, sqrt(ayg * ayg + azg * azg)) * 180.0f / M_PI;
+    roll  = atan2( ayg, azg)                          * 180.0f / M_PI;
+    yaw   = 0.0f;  // no absolute yaw reference without magnetometer
 
     Serial.println("READY");
-
     lastTime = micros();
 }
 
 // ─── loop() ──────────────────────────────────────────────────────────────────
 void loop() {
-    // ── Precise 500 Hz timing ──────────────────────────────────────────────
-    // Spin-wait until LOOP_PERIOD_US has elapsed since the last iteration.
-    // Using micros() is more precise than delay() which has millisecond
-    // resolution and cannot account for the time spent inside the loop body.
     while ((micros() - lastTime) < LOOP_PERIOD_US) {}
     unsigned long now = micros();
-    float dt = (now - lastTime) * 1e-6f;  // actual timestep in seconds
+    float dt = (now - lastTime) * 1e-6f;
     lastTime = now;
 
-    // ── Multi-sample averaging ─────────────────────────────────────────────
-    // Read NUM_AVG_SAMPLES raw samples as quickly as I2C allows and sum them.
-    // Averaging in integer arithmetic avoids floating-point rounding on every
-    // intermediate step.
+    // ── Read and average gyro samples ─────────────────────────────────────
     long rawSumX = 0, rawSumY = 0, rawSumZ = 0;
     for (int s = 0; s < NUM_AVG_SAMPLES; s++) {
         int16_t rx, ry, rz;
         readRawGyro(rx, ry, rz);
-        rawSumX += rx;
-        rawSumY += ry;
-        rawSumZ += rz;
+        rawSumX += rx; rawSumY += ry; rawSumZ += rz;
     }
+    float gx = ((float)rawSumX / NUM_AVG_SAMPLES - gyroBiasX) / GYRO_SENSITIVITY;
+    float gy = ((float)rawSumY / NUM_AVG_SAMPLES - gyroBiasY) / GYRO_SENSITIVITY;
+    float gz = ((float)rawSumZ / NUM_AVG_SAMPLES - gyroBiasZ) / GYRO_SENSITIVITY;
 
-    // ── Convert averaged raw counts to degrees per second ─────────────────
-    // Sensitivity at ±250 °/s range = 131.0 LSB/(°/s)  (from datasheet Table 1)
-    // Subtract calibration bias before dividing so the bias stays in LSB space.
-    const float SENSITIVITY = 131.0f;
-    float gx = ((float)rawSumX / NUM_AVG_SAMPLES - biasX) / SENSITIVITY;
-    float gy = ((float)rawSumY / NUM_AVG_SAMPLES - biasY) / SENSITIVITY;
-    float gz = ((float)rawSumZ / NUM_AVG_SAMPLES - biasZ) / SENSITIVITY;
+    // ── EMA smooth the gyro rates ─────────────────────────────────────────
+    filtGx = GYRO_ALPHA * gx + (1.0f - GYRO_ALPHA) * filtGx;
+    filtGy = GYRO_ALPHA * gy + (1.0f - GYRO_ALPHA) * filtGy;
+    filtGz = GYRO_ALPHA * gz + (1.0f - GYRO_ALPHA) * filtGz;
 
-    // ── Software EMA filter ────────────────────────────────────────────────
-    // filtered = alpha * new + (1 - alpha) * previous
-    // This is a first-order IIR low-pass filter.  Each new sample shifts the
-    // output 40% toward the measurement and retains 60% of the previous state.
-    filtGx = ALPHA * gx + (1.0f - ALPHA) * filtGx;
-    filtGy = ALPHA * gy + (1.0f - ALPHA) * filtGy;
-    filtGz = ALPHA * gz + (1.0f - ALPHA) * filtGz;
+    // ── Read accelerometer ─────────────────────────────────────────────────
+    int16_t ax, ay, az;
+    readRawAccel(ax, ay, az);
+    float axg = ax / ACCEL_SENSITIVITY;
+    float ayg = ay / ACCEL_SENSITIVITY;
+    float azg = az / ACCEL_SENSITIVITY;
 
-    // ── Gyroscope integration ─────────────────────────────────────────────
-    // Integrate angular rate over dt to obtain accumulated angle.
-    // This is the simplest (Euler) integration method: angle += rate * dt.
-    // It accumulates drift over time because gyros have a slowly-varying bias
-    // that calibration only removes at one temperature snapshot.  For a short
-    // flight (< 30 s) and a well-calibrated sensor this is acceptable.
-    pitch += filtGx * dt;
-    roll  += filtGy * dt;
-    yaw   += filtGz * dt;
+    // Compute absolute pitch and roll from gravity direction.
+    // atan2 returns radians; convert to degrees.
+    // These formulas assume the sensor is near-stationary; they are wrong
+    // during heavy linear acceleration (e.g. rocket boost phase), but the
+    // complementary filter's 0.98 weighting already de-weights them then.
+    float accelPitch = atan2(-axg, sqrt(ayg * ayg + azg * azg)) * 180.0f / M_PI;
+    float accelRoll  = atan2( ayg, azg)                          * 180.0f / M_PI;
 
-    // ── Serial output ──────────────────────────────────────────────────────
-    // Format: gx,gy,gz,pitch,roll,yaw,dt_us
-    // dt is sent as integer microseconds so the PC can verify loop timing.
+    // ── Complementary filter ──────────────────────────────────────────────
+    // For pitch and roll: blend gyro integration with accel absolute angle.
+    // For yaw: gyro integration only (no accel correction possible).
+    pitch = CF_ALPHA * (pitch + filtGx * dt) + (1.0f - CF_ALPHA) * accelPitch;
+    roll  = CF_ALPHA * (roll  + filtGy * dt) + (1.0f - CF_ALPHA) * accelRoll;
+    yaw  += filtGz * dt;
+
+    // ── Serial output ─────────────────────────────────────────────────────
+    // Format unchanged: gx,gy,gz,pitch,roll,yaw,dt_us
     Serial.print(filtGx, 4); Serial.print(',');
     Serial.print(filtGy, 4); Serial.print(',');
     Serial.print(filtGz, 4); Serial.print(',');
